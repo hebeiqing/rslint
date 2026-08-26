@@ -1,58 +1,79 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 
-	"github.com/microsoft/typescript-go/shim/vfs"
+	"github.com/microsoft/typescript-go/shim/bundled"
+	"github.com/microsoft/typescript-go/shim/vfs/osvfs"
 	"github.com/web-infra-dev/rslint/internal/linter"
-	"github.com/web-infra-dev/rslint/internal/rule"
 	"github.com/web-infra-dev/rslint/internal/utils"
 )
 
-// applyFixPass applies auto-fixes for all files in diagnosticsByFile,
-// writes fixed content to disk, and returns the number of issues fixed. Write
-// failures are returned after all independent files have been attempted.
-func applyFixPass(diagnosticsByFile map[string][]rule.RuleDiagnostic, fsys vfs.FS) (int, error) {
-	fixed := 0
-	fileNames := make([]string, 0, len(diagnosticsByFile))
-	for fileName := range diagnosticsByFile {
-		fileNames = append(fileNames, fileName)
+type cliAutofixWorkspace struct {
+	*cliGenerationProvider
+	sourceGeneration sourceGenerationInvalidator
+}
+
+type sourceGenerationInvalidator interface {
+	InvalidateSourceSnapshots()
+}
+
+// ApplyChanges is the physical-disk adapter for the shared autofix lifecycle.
+// Multi-file writes are deliberately best-effort rather than falsely atomic:
+// every independent file is attempted, successful writes are retained, and
+// errors are joined. Any non-empty attempt invalidates the loader's complete
+// source generation before a possible rebuild, including partial failures.
+func (w *cliAutofixWorkspace) ApplyChanges(
+	ctx context.Context,
+	changes []linter.FileChange,
+) (linter.ApplyResult, error) {
+	applyResult := linter.ApplyResult{}
+	if len(changes) == 0 {
+		return applyResult, nil
 	}
-	sort.Strings(fileNames)
 
 	var writeErrors []error
-	for _, fileName := range fileNames {
-		fileDiagnostics := diagnosticsByFile[fileName]
-		var diagnosticsWithFixes []rule.RuleDiagnostic
-		for _, d := range fileDiagnostics {
-			if len(d.Fixes()) > 0 {
-				diagnosticsWithFixes = append(diagnosticsWithFixes, d)
-			}
+	for _, change := range changes {
+		if err := ctx.Err(); err != nil {
+			writeErrors = append(writeErrors, err)
+			break
 		}
-		if len(diagnosticsWithFixes) == 0 {
+		current, ok := readPhysicalFixSource(change.Path)
+		if !ok {
+			writeErrors = append(writeErrors, fmt.Errorf("read fix target %q", change.Path))
 			continue
 		}
-
-		// The parsed text has no byte order mark — decoding the file consumed
-		// it — so put it back before fixing. ApplyRuleFixes carries it through
-		// to the bytes written here, and drops it only for a fix that asks.
-		originalContent := diagnosticsWithFixes[0].SourceFile.Text()
-		if utils.SourceHasBOM(fsys, fileName) {
-			originalContent = utils.BOM + originalContent
+		if current != change.Before {
+			writeErrors = append(writeErrors, fmt.Errorf("fix target %q changed after lint generation", change.Path))
+			continue
 		}
-		fixedContent, unapplied, wasFixed := linter.ApplyRuleFixes(originalContent, diagnosticsWithFixes)
-
-		if wasFixed {
-			err := os.WriteFile(fileName, []byte(fixedContent), 0644)
-			if err != nil {
-				writeErrors = append(writeErrors, fmt.Errorf("write fixed file %q: %w", fileName, err))
-			} else {
-				fixed += len(diagnosticsWithFixes) - len(unapplied)
-			}
+		if err := ctx.Err(); err != nil {
+			writeErrors = append(writeErrors, err)
+			break
 		}
+		if err := os.WriteFile(change.Path, []byte(change.After), 0644); err != nil {
+			writeErrors = append(writeErrors, fmt.Errorf("write fixed file %q: %w", change.Path, err))
+			continue
+		}
+		applyResult.ConfirmedPaths = append(applyResult.ConfirmedPaths, change.Path)
 	}
-	return fixed, errors.Join(writeErrors...)
+	if len(changes) > 0 {
+		w.sourceGeneration.InvalidateSourceSnapshots()
+	}
+	return applyResult, errors.Join(writeErrors...)
+}
+
+func readPhysicalFixSource(path string) (string, bool) {
+	fsys := bundled.WrapFS(osvfs.FS())
+	text, ok := fsys.ReadFile(path)
+	if !ok {
+		return "", false
+	}
+	if utils.SourceHasBOM(fsys, path) {
+		text = utils.BOM + text
+	}
+	return text, true
 }

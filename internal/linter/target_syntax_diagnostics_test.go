@@ -21,22 +21,48 @@ func syntaxDiagnosticTestProgram(t *testing.T) (*compiler.Program, string) {
 	return gapProgram(t, directory, []string{targetPath}), targetPath
 }
 
-func TestCollectTargetSyntacticDiagnosticsRespectsProgramCoverage(t *testing.T) {
+func preparedSyntaxDiagnostics(
+	t *testing.T,
+	programs []*lintprogram.Program,
+	targets [][]string,
+	programDiagnosticsIncluded bool,
+) []rule.RuleDiagnostic {
+	t.Helper()
+	return preparedSyntaxPlan(t, programs, targets).SyntacticDiagnostics(programDiagnosticsIncluded)
+}
+
+func preparedSyntaxPlan(
+	t *testing.T,
+	programs []*lintprogram.Program,
+	targets [][]string,
+) *LintPlan {
+	t.Helper()
+	plan, err := PrepareLintPlan(RunLinterOptions{
+		Programs:       programs,
+		TargetFiles:    targets,
+		SingleThreaded: true,
+		GetRulesForFile: func(*ast.SourceFile) []rule.ConfiguredRule {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
+
+func TestLintPlanSyntacticDiagnosticsRespectsProgramCoverage(t *testing.T) {
 	compilerProgram, targetPath := syntaxDiagnosticTestProgram(t)
 	compilerBacked := wrapTestPrograms(compilerProgram)
+	coveredPlan := preparedSyntaxPlan(t, compilerBacked, [][]string{{targetPath}})
+	if !coveredPlan.HasSyntacticDiagnostics() {
+		t.Fatal("target syntax state was lost when program diagnostics own emission")
+	}
 
-	if diagnostics := CollectTargetSyntacticDiagnostics(
-		compilerBacked,
-		[][]string{{targetPath}},
-		false,
-	); len(diagnostics) == 0 {
+	if diagnostics := coveredPlan.SyntacticDiagnostics(false); len(diagnostics) == 0 {
 		t.Fatal("compiler-backed target lost its syntax diagnostic")
 	}
-	if diagnostics := CollectTargetSyntacticDiagnostics(
-		compilerBacked,
-		[][]string{{targetPath}},
-		true,
-	); len(diagnostics) != 0 {
+	if diagnostics := coveredPlan.SyntacticDiagnostics(true); len(diagnostics) != 0 {
 		t.Errorf("compiler-backed diagnostics were duplicated by the lint projection: %v", diagnostics)
 	}
 
@@ -48,7 +74,7 @@ func TestCollectTargetSyntacticDiagnosticsRespectsProgramCoverage(t *testing.T) 
 	if err != nil {
 		t.Fatalf("create source-only Program: %v", err)
 	}
-	if diagnostics := CollectTargetSyntacticDiagnostics(
+	if diagnostics := preparedSyntaxDiagnostics(t,
 		[]*lintprogram.Program{sourceOnly},
 		[][]string{{targetPath}},
 		true,
@@ -57,10 +83,10 @@ func TestCollectTargetSyntacticDiagnosticsRespectsProgramCoverage(t *testing.T) 
 	}
 }
 
-func TestCollectTargetSyntacticDiagnosticsDeduplicatesSharedTargets(t *testing.T) {
+func TestLintPlanSyntacticDiagnosticsDeduplicatesSharedTargets(t *testing.T) {
 	compilerProgram, targetPath := syntaxDiagnosticTestProgram(t)
 	programs := wrapTestPrograms(compilerProgram, compilerProgram)
-	diagnostics := CollectTargetSyntacticDiagnostics(
+	diagnostics := preparedSyntaxDiagnostics(t,
 		programs,
 		[][]string{{targetPath}, {targetPath}},
 		false,

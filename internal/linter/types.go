@@ -15,6 +15,9 @@ type RuleHandler = func(sourceFile *ast.SourceFile) []rule.ConfiguredRule
 type DiagnosticHandler = func(diagnostic rule.RuleDiagnostic)
 
 // FileScope describes user-supplied "lint targets" (CLI args).
+// File paths use exact Program-facing identity; integrations resolve aliases
+// and canonical ownership before calling the linter, preferably through
+// TargetFiles.
 //
 // Both fields are independently nullable:
 //   - nil slice  → that dimension does not constrain (e.g. Files=nil

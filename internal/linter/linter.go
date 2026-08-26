@@ -3,7 +3,6 @@ package linter
 import (
 	"context"
 	"errors"
-	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -42,39 +41,16 @@ func validatePrograms(sourcePrograms []*program.Program) error {
 	return nil
 }
 
-// isFileAllowed checks if fileName matches any path in allowFiles.
-// It first tries fast string equality, then falls back to os.SameFile
-// (using pre-computed FileInfo) to handle symlinks (e.g. /var vs /private/var on macOS).
-func isFileAllowed(fileName string, allowFiles []string, allowFileInfos []os.FileInfo) bool {
+// isFileAllowed checks exact Program-facing path identity. Integrations that
+// accept lexical aliases resolve them before execution and use TargetFiles;
+// the linter never consults a physical filesystem to reinterpret identity.
+func isFileAllowed(fileName string, allowFiles []string) bool {
 	for _, filePath := range allowFiles {
 		if filePath == fileName {
 			return true
 		}
 	}
-	// Fallback: compare by inode to handle directory symlinks
-	fileInfo, err := os.Stat(fileName)
-	if err != nil {
-		return false
-	}
-	for _, info := range allowFileInfos {
-		if os.SameFile(fileInfo, info) {
-			return true
-		}
-	}
 	return false
-}
-
-// precomputeAllowFileInfos collects os.FileInfo for each allowFile once,
-// so that isFileAllowed can use os.SameFile without repeated os.Stat calls.
-// Files that do not exist are silently skipped.
-func precomputeAllowFileInfos(allowFiles []string) []os.FileInfo {
-	infos := make([]os.FileInfo, 0, len(allowFiles))
-	for _, f := range allowFiles {
-		if info, err := os.Stat(f); err == nil {
-			infos = append(infos, info)
-		}
-	}
-	return infos
 }
 
 // isDirAllowed checks if fileName is inside any directory in allowDirs.
@@ -510,13 +486,6 @@ func filterNativeRules(rules []rule.ConfiguredRule) []rule.ConfiguredRule {
 	return nativeRules
 }
 
-func shouldSkipRulesForSyntax(opts programPlanOptions, file *ast.SourceFile, ctx context.Context) bool {
-	if opts.SkipSyntaxCheck {
-		return false
-	}
-	return len(opts.Program.SyntacticDiagnostics(ctx, file)) > 0
-}
-
 // RunLinter runs all configured lint rules across the given programs in
 // parallel, then optionally collects program-level type-check diagnostics
 // aligned with `tsc --noEmit` semantics.
@@ -636,13 +605,9 @@ func collectFilesToLint(opts programPlanOptions) []*ast.SourceFile {
 	if opts.HasTargetFiles {
 		return collectExactFilesToLint(opts)
 	}
-	var allowFileInfos []os.FileInfo
-	if opts.Scope.Files != nil {
-		allowFileInfos = precomputeAllowFileInfos(opts.Scope.Files)
-	}
 	files := opts.Program.SourceFiles()
 	for fileIndex, file := range files {
-		if filePassesLintProjection(opts, file, allowFileInfos) {
+		if filePassesLintProjection(opts, file) {
 			continue
 		}
 		// Program owns an immutable source slice. Allocate only when selection
@@ -651,7 +616,7 @@ func collectFilesToLint(opts programPlanOptions) []*ast.SourceFile {
 		filesToLint := make([]*ast.SourceFile, 0, len(files)-1)
 		filesToLint = append(filesToLint, files[:fileIndex]...)
 		for _, remaining := range files[fileIndex+1:] {
-			if filePassesLintProjection(opts, remaining, allowFileInfos) {
+			if filePassesLintProjection(opts, remaining) {
 				filesToLint = append(filesToLint, remaining)
 			}
 		}
@@ -660,7 +625,7 @@ func collectFilesToLint(opts programPlanOptions) []*ast.SourceFile {
 	return files
 }
 
-func filePassesLintProjection(opts programPlanOptions, file *ast.SourceFile, allowFileInfos []os.FileInfo) bool {
+func filePassesLintProjection(opts programPlanOptions, file *ast.SourceFile) bool {
 	p := string(file.Path())
 	for _, skipPattern := range opts.ExcludePaths {
 		if strings.Contains(p, skipPattern) {
@@ -669,7 +634,7 @@ func filePassesLintProjection(opts programPlanOptions, file *ast.SourceFile, all
 	}
 	// Scope dimensions use OR semantics when either one is present.
 	if opts.Scope.Files != nil || opts.Scope.Dirs != nil {
-		fileAllowed := opts.Scope.Files != nil && isFileAllowed(file.FileName(), opts.Scope.Files, allowFileInfos)
+		fileAllowed := opts.Scope.Files != nil && isFileAllowed(file.FileName(), opts.Scope.Files)
 		dirAllowed := opts.Scope.Dirs != nil && isDirAllowed(file.FileName(), opts.Scope.Dirs)
 		if !fileAllowed && !dirAllowed {
 			return false

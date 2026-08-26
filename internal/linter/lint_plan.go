@@ -2,6 +2,7 @@ package linter
 
 import (
 	"context"
+	"errors"
 	"runtime"
 
 	"github.com/microsoft/typescript-go/shim/ast"
@@ -33,11 +34,19 @@ type lintFilePlan struct {
 	rules          []rule.ConfiguredRule
 	environment    *rule.RuleEnvironment
 	hasTypeChecker bool
+	syntax         []rule.RuleDiagnostic
 }
 
 type lintPlanFileRef struct {
 	programIndex int
 	fileIndex    int
+}
+
+type syntacticDiagnosticKey struct {
+	path     string
+	ruleName string
+	pos      int
+	end      int
 }
 
 // LintTarget is one non-syntax-error file paired with its non-empty configured
@@ -55,6 +64,19 @@ type LintTarget struct {
 // concurrency requirement. Source-universe validation happens once in the
 // internal/program constructor, before the Program can reach this planner.
 func PrepareLintPlan(opts RunLinterOptions) (*LintPlan, error) {
+	return PrepareLintPlanContext(context.Background(), opts)
+}
+
+// PrepareLintPlanContext is PrepareLintPlan with a caller-owned context for
+// generation-scoped syntax/capability queries. The execution engine itself
+// retains its existing non-cancellable scheduling contract.
+func PrepareLintPlanContext(ctx context.Context, opts RunLinterOptions) (*LintPlan, error) {
+	if ctx == nil {
+		return nil, errors.New("linter: context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if opts.GetRulesForFile == nil {
 		return &LintPlan{}, nil
 	}
@@ -91,17 +113,19 @@ func PrepareLintPlan(opts RunLinterOptions) (*LintPlan, error) {
 	}
 
 	resolve := func(ref lintPlanFileRef, ctx context.Context) {
+		if ctx.Err() != nil {
+			return
+		}
 		programPlan := &plan.programs[ref.programIndex]
 		resolveProgramLintPlanFile(programOpts[ref.programIndex], programPlan, ref.fileIndex, ctx)
 	}
 
 	workerCount := min(runtime.GOMAXPROCS(0), len(refs))
 	if opts.SingleThreaded || workerCount < 2 {
-		ctx := context.Background()
 		for _, ref := range refs {
 			resolve(ref, ctx)
 		}
-		return plan, nil
+		return plan, ctx.Err()
 	}
 
 	chunkSize := (len(refs) + workerCount - 1) / workerCount
@@ -114,14 +138,13 @@ func PrepareLintPlan(opts RunLinterOptions) (*LintPlan, error) {
 		}
 		chunk := refs[start:end]
 		work.Queue(func() {
-			ctx := context.Background()
 			for _, ref := range chunk {
 				resolve(ref, ctx)
 			}
 		})
 	}
 	work.RunAndWait()
-	return plan, nil
+	return plan, ctx.Err()
 }
 
 func newProgramLintPlan(opts programPlanOptions) (programLintPlan, error) {
@@ -154,7 +177,13 @@ func prepareProgramLintPlan(opts programPlanOptions) (programLintPlan, error) {
 func resolveProgramLintPlanFile(opts programPlanOptions, plan *programLintPlan, fileIndex int, ctx context.Context) {
 	filePlan := &plan.files[fileIndex]
 	file := filePlan.file
-	if shouldSkipRulesForSyntax(opts, file, ctx) {
+	if !opts.SkipSyntaxCheck {
+		filePlan.syntax = CollectFileSyntacticDiagnostics(ctx, opts.Program, file)
+		if len(filePlan.syntax) > 0 {
+			return
+		}
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	rules := opts.GetRulesForFile(file)
@@ -168,6 +197,54 @@ func resolveProgramLintPlanFile(opts programPlanOptions, plan *programLintPlan, 
 		filePlan.rules = rule.FilterNonTypeAwareRules(rules)
 	}
 	filePlan.environment = firstNativeRuleEnvironment(filePlan.rules)
+}
+
+// SyntacticDiagnostics returns the syntax results already collected while the
+// plan froze rule eligibility. Project-backed Programs may be omitted when a
+// later program-diagnostics phase will report the same errors.
+func (p *LintPlan) SyntacticDiagnostics(programDiagnosticsIncluded bool) []rule.RuleDiagnostic {
+	if p == nil {
+		return nil
+	}
+	seen := make(map[syntacticDiagnosticKey]struct{})
+	var diagnostics []rule.RuleDiagnostic
+	for _, programPlan := range p.programs {
+		if programDiagnosticsIncluded && programPlan.program.CanProvideProgramDiagnostics() {
+			continue
+		}
+		for _, filePlan := range programPlan.files {
+			for _, diagnostic := range filePlan.syntax {
+				key := syntacticDiagnosticKey{
+					path:     diagnostic.FilePath,
+					ruleName: diagnostic.RuleName,
+					pos:      diagnostic.Range.Pos(),
+					end:      diagnostic.Range.End(),
+				}
+				if _, exists := seen[key]; exists {
+					continue
+				}
+				seen[key] = struct{}{}
+				diagnostics = append(diagnostics, diagnostic)
+			}
+		}
+	}
+	return diagnostics
+}
+
+// HasSyntacticDiagnostics reports whether any selected target has a syntax
+// error, independently from which producer is responsible for emitting it.
+func (p *LintPlan) HasSyntacticDiagnostics() bool {
+	if p == nil {
+		return false
+	}
+	for _, programPlan := range p.programs {
+		for _, filePlan := range programPlan.files {
+			if len(filePlan.syntax) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func firstNativeRuleEnvironment(rules []rule.ConfiguredRule) *rule.RuleEnvironment {
@@ -196,6 +273,26 @@ func (p *LintPlan) Targets() []LintTarget {
 		}
 	}
 	return targets
+}
+
+// Files returns every selected source file in stable Program/file order,
+// including syntax-error and zero-rule files. The returned slice is detached
+// from the immutable plan and may be modified by the caller.
+func (p *LintPlan) Files() []*ast.SourceFile {
+	if p == nil {
+		return nil
+	}
+	fileCount := 0
+	for _, programPlan := range p.programs {
+		fileCount += len(programPlan.files)
+	}
+	files := make([]*ast.SourceFile, 0, fileCount)
+	for _, programPlan := range p.programs {
+		for _, filePlan := range programPlan.files {
+			files = append(files, filePlan.file)
+		}
+	}
+	return files
 }
 
 func programPlanOptionsFor(opts RunLinterOptions, programIndex int) programPlanOptions {

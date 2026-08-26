@@ -76,7 +76,7 @@ func runLintPipelineForTest(t *testing.T, cwd string, args lintArgs) (int, strin
 	originalStdout, originalStderr := os.Stdout, os.Stderr
 	os.Stdout, os.Stderr = stdoutW, stderrW
 
-	code := executeLintPipeline(args, context.Background(), nil)
+	code := handleLintCommand(args, context.Background(), nil)
 
 	os.Stdout, os.Stderr = originalStdout, originalStderr
 	if err := stdoutW.Close(); err != nil {
@@ -665,62 +665,6 @@ func TestSyntacticErrorType(t *testing.T) {
 	}
 	if syntacticErr.Diagnostics[0].File() == nil {
 		t.Fatal("Diagnostic should have a file")
-	}
-}
-
-// ======== groupDiagsByFile tests ========
-
-func TestGroupDiagsByFile_Empty(t *testing.T) {
-	result := groupDiagsByFile(nil)
-	if len(result) != 0 {
-		t.Errorf("expected empty map for nil input, got %d entries", len(result))
-	}
-
-	result = groupDiagsByFile([]rule.RuleDiagnostic{})
-	if len(result) != 0 {
-		t.Errorf("expected empty map for empty input, got %d entries", len(result))
-	}
-}
-
-func TestGroupDiagsByFile_SingleFile(t *testing.T) {
-	source := "const x = 1;\nconst y = 2;\n"
-	d1, _ := createTestDiagnostic(t, source, 0, 5)
-	// Create a second diagnostic from the SAME source file
-	d2 := d1
-	d2.Range = core.NewTextRange(13, 18)
-	d2.Message = rule.RuleMessage{Id: "test2", Description: "Second diagnostic"}
-
-	result := groupDiagsByFile([]rule.RuleDiagnostic{d1, d2})
-
-	if len(result) != 1 {
-		t.Fatalf("expected 1 file group, got %d", len(result))
-	}
-
-	for _, diags := range result {
-		if len(diags) != 2 {
-			t.Errorf("expected 2 diagnostics in group, got %d", len(diags))
-		}
-	}
-}
-
-func TestGroupDiagsByFile_MultipleFiles(t *testing.T) {
-	// Create diagnostics from two different temp directories (different files)
-	sourceA := "const a = 1;"
-	sourceB := "const b = 2;"
-	dA, _ := createTestDiagnostic(t, sourceA, 0, 5)
-	dB, _ := createTestDiagnostic(t, sourceB, 0, 5)
-
-	result := groupDiagsByFile([]rule.RuleDiagnostic{dA, dB})
-
-	// Each diagnostic comes from a different temp dir → different file names
-	if len(result) != 2 {
-		t.Fatalf("expected 2 file groups, got %d", len(result))
-	}
-
-	for _, diags := range result {
-		if len(diags) != 1 {
-			t.Errorf("expected 1 diagnostic per file, got %d", len(diags))
-		}
 	}
 }
 
@@ -1998,23 +1942,6 @@ func TestPrintDiagnosticGitLab(t *testing.T) {
 	}
 }
 
-func TestRemapDiagnosticTargetPaths(t *testing.T) {
-	diagnostics := []rule.RuleDiagnostic{
-		{FilePath: "/program/link.ts"},
-		{FilePath: "/program/unchanged.ts"},
-	}
-	remapDiagnosticTargetPaths(diagnostics, map[string]target.File{
-		"/program/link.ts": {PathIdentity: rslintconfig.PathIdentity{Path: "/requested/real.ts"}},
-	})
-
-	if diagnostics[0].FilePath != "/requested/real.ts" {
-		t.Fatalf("expected requested target path, got %q", diagnostics[0].FilePath)
-	}
-	if diagnostics[1].FilePath != "/program/unchanged.ts" {
-		t.Fatalf("unexpected remap of unrelated diagnostic: %q", diagnostics[1].FilePath)
-	}
-}
-
 func TestDeduplicateTypeScriptDiagnosticsAcrossPathAliases(t *testing.T) {
 	dir := t.TempDir()
 	realPath := filepath.Join(dir, "real.ts")
@@ -2093,26 +2020,108 @@ func TestDeduplicateTypeScriptDiagnosticsPrefersCallerTarget(t *testing.T) {
 	}
 }
 
-func TestApplyFixPassReturnsWriteError(t *testing.T) {
-	diagnostic, _ := createTestDiagnostic(t, "a", 0, 1)
-	diagnostic.FixesPtr = &[]rule.RuleFix{{
-		Range: core.NewTextRange(0, 1),
-		Text:  "b",
-	}}
-	directoryPath := t.TempDir()
+type countingSourceGenerationInvalidator struct{ calls int }
 
-	fixed, err := applyFixPass(map[string][]rule.RuleDiagnostic{
-		directoryPath: {diagnostic},
-	}, bundled.WrapFS(cachedvfs.From(osvfs.FS())))
+func (i *countingSourceGenerationInvalidator) InvalidateSourceSnapshots() { i.calls++ }
+
+func TestCLIAutofixWorkspaceReturnsPartialWritesAndJoinedError(t *testing.T) {
+	directoryPath := t.TempDir()
+	filePath := filepath.Join(directoryPath, "written.ts")
+	if err := os.WriteFile(filePath, []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidator := &countingSourceGenerationInvalidator{}
+	workspace := &cliAutofixWorkspace{
+		sourceGeneration: invalidator,
+	}
+
+	result, err := workspace.ApplyChanges(context.Background(), []linter.FileChange{
+		{Path: directoryPath, Before: "a", After: "b", AppliedDiagnostics: 1},
+		{Path: filePath, Before: "a", After: "b", AppliedDiagnostics: 1},
+	})
 	if err == nil {
 		t.Fatal("expected a write error")
 		return
 	}
-	if fixed != 0 {
-		t.Fatalf("failed write must not count as a fix, got %d", fixed)
+	if !slices.Equal(result.ConfirmedPaths, []string{filePath}) {
+		t.Fatalf("partial write result was not preserved, got %+v", result)
 	}
-	if !strings.Contains(err.Error(), directoryPath) {
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", directoryPath)) {
 		t.Fatalf("write error must identify the target path, got %v", err)
+	}
+	if invalidator.calls != 1 {
+		t.Fatalf("source generation invalidations = %d, want exactly one", invalidator.calls)
+	}
+	if content, readErr := os.ReadFile(filePath); readErr != nil || string(content) != "b" {
+		t.Fatalf("independent successful write was lost: content=%q error=%v", content, readErr)
+	}
+}
+
+func TestCLIAutofixWorkspaceRejectsStaleDiskGeneration(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "stale.ts")
+	if err := os.WriteFile(filePath, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	invalidator := &countingSourceGenerationInvalidator{}
+	workspace := &cliAutofixWorkspace{sourceGeneration: invalidator}
+
+	result, err := workspace.ApplyChanges(context.Background(), []linter.FileChange{{
+		Path:               filePath,
+		Before:             "old",
+		After:              "fixed",
+		AppliedDiagnostics: 1,
+	}})
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%q", filePath)) || !strings.Contains(err.Error(), "changed after lint generation") {
+		t.Fatalf("stale write error = %v", err)
+	}
+	if len(result.ConfirmedPaths) != 0 {
+		t.Fatalf("stale write result = %+v", result)
+	}
+	if invalidator.calls != 1 {
+		t.Fatalf("source generation invalidations = %d, want exactly one", invalidator.calls)
+	}
+	if content, readErr := os.ReadFile(filePath); readErr != nil || string(content) != "new" {
+		t.Fatalf("stale target was overwritten: content=%q error=%v", content, readErr)
+	}
+}
+
+func TestReadPhysicalFixSourcePreservesEncodingAndSourceBOM(t *testing.T) {
+	directoryPath := t.TempDir()
+	tests := []struct {
+		name string
+		raw  []byte
+		want string
+	}{
+		{
+			name: "UTF-8 encoding mark plus source mark",
+			raw:  []byte(utils.BOM + utils.BOM + "const value = 1;"),
+			want: utils.BOM + utils.BOM + "const value = 1;",
+		},
+		{
+			name: "UTF-16 little endian",
+			raw:  []byte{0xFF, 0xFE, 'a', 0x00},
+			want: utils.BOM + "a",
+		},
+		{
+			name: "UTF-16 big endian",
+			raw:  []byte{0xFE, 0xFF, 0x00, 'a'},
+			want: utils.BOM + "a",
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			filePath := filepath.Join(directoryPath, fmt.Sprintf("encoded-%d.ts", index))
+			if err := os.WriteFile(filePath, test.raw, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			got, ok := readPhysicalFixSource(filePath)
+			if !ok {
+				t.Fatal("physical fix source could not be read")
+			}
+			if got != test.want {
+				t.Fatalf("physical fix source = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

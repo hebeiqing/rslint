@@ -303,6 +303,7 @@ Lingui
 lingui
 lintable
 lintedfile
+lintpipeline
 lintprogram
 listitem
 litera
